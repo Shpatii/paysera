@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "license": "UNLICENSED",
   "scripts": {
+    "start": "node server.js",
     "shopify": "shopify",
     "build": "shopify app build",
     "dev": "shopify app dev",
