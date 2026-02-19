@@ -195,6 +195,7 @@ app.post("/webhooks/orders-create", async (req, res) => {
 
     // ✅ REAL PRICES FROM SHOPIFY
     const amount = String(order?.total_price || "0");
+    const SHOP_URL = process.env.SHOP_URL;
     const currency = String(order?.currency || "EUR");
     const description = `Payment for order ${order?.name || order?.id}`;
 
@@ -203,9 +204,9 @@ app.post("/webhooks/orders-create", async (req, res) => {
       amount,
       currency_iso: currency,
       description,
-      approve_url: "https://dyqani-bio-test.myshopify.com",
-      decline_url: "https://dyqani-bio-test.myshopify.com",
-      cancel_url: "https://dyqani-bio-test.myshopify.com",
+      approve_url: "https://dyqanibio.com",
+      decline_url: "https://dyqanibio.com",
+      cancel_url: "https://dyqanibio.com",
       callback_url: `${PUBLIC_BASE_URL}/procard/callback`,
       email: order?.email || "",
       phone: order?.phone || "",
