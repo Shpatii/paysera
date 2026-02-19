@@ -181,7 +181,7 @@ app.post("/webhooks/orders-create", async (req, res) => {
 
     const gateways = order?.payment_gateway_names || [];
     const isPayseraManual = gateways.some((g) =>
-      String(g || "").toLowerCase().includes("paysera")
+      String(g || "").toLowerCase().includes("pay online")
     );
 
     console.log("✅ orders/create webhook received");
