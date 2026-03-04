@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import crypto from "crypto";
 import "dotenv/config";
@@ -31,6 +30,11 @@ const SHOPIFY_WEBHOOK_SECRET = String(process.env.SHOPIFY_WEBHOOK_SECRET || "").
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_FROM = process.env.EMAIL_FROM;
 const TEST_EMAIL_TO = process.env.TEST_EMAIL_TO; // if set, all emails go here
+
+// ✅ Shopify Admin API (to mark the order PAID)
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP; // e.g. dyqanibio.myshopify.com
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN; // Custom app Admin API token
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
 // ===============================
 
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
@@ -164,11 +168,104 @@ async function sendPaymentEmail({ to, orderName, amount, currency, paymentUrl })
   });
 }
 
+/**
+ * ✅ Shopify Admin GraphQL: Mark order as PAID
+ * Requires your Custom App Admin API access token with write_orders
+ */
+async function shopifyMarkOrderPaid(orderIdNumeric) {
+  if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN) {
+    throw new Error("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN in .env");
+  }
+
+  const gid = `gid://shopify/Order/${orderIdNumeric}`;
+
+  const query = `
+    mutation MarkAsPaid($input: OrderMarkAsPaidInput!) {
+      orderMarkAsPaid(input: $input) {
+        order { id name displayFinancialStatus }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const resp = await fetch(
+    `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+      },
+      body: JSON.stringify({
+        query,
+        variables: { input: { id: gid } },
+      }),
+    }
+  );
+
+  const json = await resp.json().catch(() => ({}));
+  const userErrors = json?.data?.orderMarkAsPaid?.userErrors || [];
+
+  if (!resp.ok || userErrors.length || (json?.errors || []).length) {
+    throw new Error(
+      `orderMarkAsPaid failed: HTTP ${resp.status} userErrors=${JSON.stringify(
+        userErrors
+      )} errors=${JSON.stringify(json?.errors || [])}`
+    );
+  }
+
+  return json?.data?.orderMarkAsPaid?.order;
+}
+
+/**
+ * ✅ Very safe "success" detection:
+ * We DON'T know Procard's success field yet, so we only mark as paid if:
+ * - signature valid
+ * - has core fields
+ * - status matches common success values
+ *
+ * After you see one successful callback payload, you can tighten this.
+ */
+function procardLooksSuccessful(body) {
+  const hasCore = body?.orderReference && body?.amount != null && body?.currency;
+  if (!hasCore) return false;
+
+  const statusRaw =
+    body?.transactionStatus ??
+    body?.status ??
+    body?.state ??
+    body?.result ??
+    body?.approved ??
+    body?.success;
+
+  if (statusRaw === true) return true;
+
+  const s = String(statusRaw ?? "").toLowerCase();
+  return (
+    s === "success" ||
+    s === "paid" ||
+    s === "approved" ||
+    s === "completed" ||
+    s === "ok" ||
+    s === "true" ||
+    s === "1"
+  );
+}
+
+// Simple in-memory dedupe (dev). Use DB/Redis in prod.
+const processed = new Set();
+function alreadyProcessed(key) {
+  if (!key) return false;
+  if (processed.has(key)) return true;
+  processed.add(key);
+  setTimeout(() => processed.delete(key), 60 * 60 * 1000).unref?.();
+  return false;
+}
+
 app.get("/", (req, res) => res.send("OK"));
 
 // Shopify webhook: orders/create  ✅ RAW BODY route
 app.post("/webhooks/orders-create", async (req, res) => {
-  // Shopify webhook route uses express.raw => req.body is Buffer
   try {
     const rawBody = req.body; // Buffer
 
@@ -193,9 +290,7 @@ app.post("/webhooks/orders-create", async (req, res) => {
     if (!isPayseraManual) return res.status(200).send("OK");
     if (!PUBLIC_BASE_URL) throw new Error("Missing PUBLIC_BASE_URL in .env");
 
-    // ✅ REAL PRICES FROM SHOPIFY
     const amount = String(order?.total_price || "0");
-    const SHOP_URL = process.env.SHOP_URL;
     const currency = String(order?.currency || "EUR");
     const description = `Payment for order ${order?.name || order?.id}`;
 
@@ -219,7 +314,6 @@ app.post("/webhooks/orders-create", async (req, res) => {
 
     console.log("✅ PROCARD payment URL:", paymentUrl);
 
-    // ✅ EMAIL (TEST MODE)
     const recipient = TEST_EMAIL_TO || order?.email;
     if (recipient) {
       await sendPaymentEmail({
@@ -235,22 +329,51 @@ app.post("/webhooks/orders-create", async (req, res) => {
     }
   } catch (e) {
     console.log("❌ orders/create handler error:", String(e?.message || e));
-    // still reply OK so Shopify doesn't keep retrying forever while you debug
   }
 
   return res.status(200).send("OK");
 });
 
-// Procard callback (JSON route)
-app.post("/procard/callback", (req, res) => {
-  console.log("✅ procard callback received");
-  console.log("Body:", req.body);
+// ✅ Procard callback (JSON route) — now marks order as PAID on success
+app.post("/procard/callback", async (req, res) => {
+  try {
+    console.log("✅ procard callback received");
+    console.log("Body:", req.body);
 
-  const ok = verifyProcardCallbackSignature(req.body);
-  console.log("Signature valid:", ok);
-  console.log("Status:", req.body?.transactionStatus);
+    const ok = verifyProcardCallbackSignature(req.body);
+    console.log("Signature valid:", ok);
 
-  res.status(200).send("OK");
+    if (!ok) return res.status(401).send("Invalid signature");
+
+    // Dedup key: order + amount + currency + optional transaction id
+    const txnId = req.body?.transactionId || req.body?.transaction_id || req.body?.reference || "";
+    const key = `${req.body?.orderReference}:${req.body?.amount}:${req.body?.currency}:${txnId}`;
+    if (alreadyProcessed(key)) {
+      console.log("↩️ Duplicate callback ignored:", key);
+      return res.status(200).send("OK");
+    }
+
+    // Only mark as paid if callback looks like a SUCCESS
+    const success = procardLooksSuccessful(req.body);
+    console.log("Looks successful:", success);
+
+    if (!success) return res.status(200).send("OK");
+
+    const shopifyOrderId = String(req.body?.orderReference || "").trim();
+    if (!shopifyOrderId) {
+      console.log("❌ Missing orderReference in callback");
+      return res.status(200).send("OK");
+    }
+
+    const order = await shopifyMarkOrderPaid(shopifyOrderId);
+    console.log("✅ Shopify order marked PAID:", order?.name, order?.displayFinancialStatus);
+
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.log("❌ procard callback handler error:", String(e?.message || e));
+    // keep 200 so provider doesn't spam retries while you debug
+    return res.status(200).send("OK");
+  }
 });
 
 const PORT = process.env.PORT || 3000;
